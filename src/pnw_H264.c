@@ -546,6 +546,39 @@ static void psb__H264_trace_pic_params(VAPictureParameterBufferH264 *p)
     P(frame_num);
 }
 
+static uint32_t get_interpic_dpbidx(context_H264_p ctx, uint32_t picture_id)
+{
+    uint32_t dpbidx, i ,max_count;
+
+    /* check if picture_id is already allocated a dpbidx */
+    for (dpbidx = 0; dpbidx < 16; dpbidx++)
+        if (ctx->map_picture_id_to_dpbidx[dpbidx] == picture_id)
+            break;
+
+    /* assign a new picture_id to a new/recycled dpbidx */
+    if (16 == dpbidx)
+    {
+        dpbidx = 0;
+        max_count = ctx->dpbidx_not_used_cnt[0];
+        for (i = 1; i < 16; i++)
+        {
+            if (ctx->dpbidx_not_used_cnt[i] > max_count)
+            {
+                dpbidx = i;
+                max_count = ctx->dpbidx_not_used_cnt[i];
+            }
+        }
+        ctx->map_picture_id_to_dpbidx[dpbidx] = picture_id;
+        ctx->dpbidx_not_used_cnt[dpbidx] = 0;
+    }
+
+    /* record this dpbidx is used this pic to update the dpbidx_not_used_cnt later */
+    ctx->dpbidx_used_this_pic_flags |= (1 << dpbidx);
+
+    return dpbidx;
+}
+
+
 static VAStatus psb__H264_process_picture_param(context_H264_p ctx, object_buffer_p obj_buffer)
 {
     psb_surface_p target_surface = ctx->obj_context->current_render_target->psb_surface;
@@ -995,7 +1028,7 @@ static void psb__H264_build_SCA_chunk(context_H264_p ctx)
     psb_cmdbuf_rendec_end(cmdbuf);
 }
 
-static void psb__H264_build_picture_order_chunk(context_H264_p ctx)
+static void psb__H264_build_picture_order_chunk(context_H264_p ctx, uint32_t * map)
 {
     psb_cmdbuf_p cmdbuf = ctx->obj_context->cmdbuf;
     VAPictureParameterBufferH264 *pic_params = ctx->pic_params;
@@ -1192,6 +1225,36 @@ static void psb__H264_build_rendec_params(context_H264_p ctx, VASliceParameterBu
     uint32_t reg_value;
     unsigned int i;
 
+    int picture_id = ctx->obj_context->current_render_target->surface_id;
+    for(i = 0; i < 16; i++) {
+        if (ctx->map_picture_id_to_dpbidx[i] == (unsigned int)picture_id)
+            break;
+    }
+
+    if (i < 16) {
+        ctx->map_picture_id_to_dpbidx[i] = 0xff;
+        ctx->dpbidx_not_used_cnt[i] = 0xff00;
+    }
+
+    /* get the dpbidx for the ref pictures */
+        uint32_t map_dpbidx_to_refidx[16];
+        memset(map_dpbidx_to_refidx, 0xff, sizeof(map_dpbidx_to_refidx));
+
+       if (pic_params->num_ref_frames > 16)
+           pic_params->num_ref_frames = 16;
+       for (i = 0; i < pic_params->num_ref_frames; i++) {
+            if (pic_params->ReferenceFrames[i].flags == VA_PICTURE_H264_INVALID) {
+                continue;
+            }
+            object_surface_p ref_surface = SURFACE(pic_params->ReferenceFrames[i].picture_id);
+            if (ref_surface) {
+                uint32_t idx = GET_SURFACE_INFO_dpb_idx(ref_surface->psb_surface);
+                if (idx < 16) {
+                    map_dpbidx_to_refidx[idx] = i;
+                }
+            }
+        }
+
     /* psb_cmdbuf_rendec_start_block( cmdbuf ); */
 
     /* CHUNK: Entdec back-end profile and level */
@@ -1246,7 +1309,7 @@ static void psb__H264_build_rendec_params(context_H264_p ctx, VASliceParameterBu
     /* send Picture Order Counts (b frame only?) */
     /* maybe need a state variable to track if this has already been sent for the frame */
     if (slice_param->slice_type == ST_B) {
-        psb__H264_build_picture_order_chunk(ctx);
+        psb__H264_build_picture_order_chunk(ctx, map_dpbidx_to_refidx);
     }
 
     /* CHUNK: BIN */
@@ -1323,9 +1386,9 @@ static void psb__H264_build_rendec_params(context_H264_p ctx, VASliceParameterBu
                     psb_cmdbuf_rendec_write(cmdbuf, 0xdeadbeef);
                 }
             } else {
-                psb_cmdbuf_rendec_write(cmdbuf, 0xdeadbeef);
-                psb_cmdbuf_rendec_write(cmdbuf, 0xdeadbeef);
-            }
+            psb_cmdbuf_rendec_write(cmdbuf, 0xdeadbeef);
+            psb_cmdbuf_rendec_write(cmdbuf, 0xdeadbeef);
+        }
         }
         psb_cmdbuf_rendec_end(cmdbuf);
     }
